@@ -186,6 +186,10 @@ async function loadScene(index) {
   }
 }
 
+
+
+
+// 处理答题结果，并记录当前场景的得分，进行了更改了
 function onAnswer(data) {
   const sceneId = sceneList.value[currentSceneIndex.value]?.id
   if (!sceneId) {
@@ -193,8 +197,8 @@ function onAnswer(data) {
     return
   }
 
-  if (sceneAnswered.value[sceneId] || sceneCompleted.value[sceneId]) {
-    console.warn('⚠️ 场景已答题或已完成，忽略')
+  if (sceneCompleted.value[sceneId]) {
+    console.warn('⚠️ 场景已完成，忽略')
     return
   }
 
@@ -203,13 +207,11 @@ function onAnswer(data) {
   if (data.isCorrect) {
     currentSceneScore.value += 1
     totalScoreAll.value += 1
-  }
+  } 
   sceneScoreRecord.value[sceneId] = currentSceneScore.value
 
-  sceneAnswered.value[sceneId] = true
-  isSceneLocked.value = true
 
-  statusMessage.value = `📌 已答题，点击"完成实习"结束本场景`
+  statusMessage.value = `📋 ${currentSceneName.value} - 任务 ${currentTaskIndex.value + 1}/${quests.value.length}`
   statusType.value = 'info'
 }
 
@@ -222,20 +224,35 @@ function onInteract(data) {
   }
 }
 
+
+
+//进行了任务完成的处理，多任务的判断，不会关闭弹窗，进行了更改了
 function onTaskComplete() {
   const sceneId = sceneList.value[currentSceneIndex.value]?.id
   if (!sceneId) return
 
-  if (!sceneCompleted.value[sceneId]) {
-    sceneCompleted.value[sceneId] = true
-    sceneScoreRecord.value[sceneId] = currentSceneScore.value
+  // 判断：是否还有下一题
+  if (currentTaskIndex.value < quests.value.length - 1) {
+    // 还有题目：下标+1，切换下一题，不关闭弹窗、不锁定场景
+    currentTaskIndex.value += 1
+    currentTask.value = quests.value[currentTaskIndex.value]
+    statusMessage.value = `📋 ${currentSceneName.value} - 任务 ${currentTaskIndex.value + 1}/${quests.value.length}`
+    statusType.value = 'info'
+  } else {
+    // 已经是最后一题：正式结束场景
+    if (!sceneCompleted.value[sceneId]) {
+      sceneCompleted.value[sceneId] = true
+      sceneScoreRecord.value[sceneId] = currentSceneScore.value
+    }
+    isSceneLocked.value = true
+    taskVisible.value = false
+    statusMessage.value = `✅ ${sceneList.value[currentSceneIndex.value].sceneName} 完成！得分: ${currentSceneScore.value}`
+    statusType.value = 'success'
   }
-  isSceneLocked.value = true
-  taskVisible.value = false
-
-  statusMessage.value = `✅ ${sceneList.value[currentSceneIndex.value].sceneName} 完成！得分: ${currentSceneScore.value}`
-  statusType.value = 'success'
 }
+
+
+
 
 function goPrevScene() {
   if (currentSceneIndex.value > 0) loadScene(currentSceneIndex.value - 1)

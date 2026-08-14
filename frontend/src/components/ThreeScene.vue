@@ -16,6 +16,16 @@ const containerRef = ref(null)
 const overlayRef = ref(null)
 const emit = defineEmits(['scene-ready', 'interact'])
 
+// ===== 玩家模型配置（Mixamo：模型与动画分开下载） =====
+const PLAYER_MODEL_CONFIG = {
+  modelUrl: '/models/Ch33_nonPBR.fbx',          // 西装男模型（含骨骼，无动画数据也可）
+  idleUrl:  '/models/Ch33_nonPBR@Idle.fbx',     // 待机动画（Without Skin）
+  walkUrl:  '/models/Ch33_nonPBR@Walking.fbx',  // 走路动画（Without Skin）
+  scale: 0.008,                                 // Mixamo FBX 缩放（缩小到与NPC比例匹配）
+  groundOffset: 0,                              // 脚底贴地微调（正值上移，负值下移）
+  walkTimeScale: 0.8,                           // 行走步频（<1慢，>1快，调到与移动速度匹配）
+}
+
 // ===== 核心变量 =====
 let scene, camera, renderer, labelRenderer
 let sceneObjects, player, playerMixer
@@ -26,7 +36,7 @@ let targetOrbitPitch = 0.5
 let isDragging = false
 let prevMouse = { x: 0, y: 0 }
 const keys = { w: false, a: false, s: false, d: false, f: false }
-const playerSpeed = 4.5
+const playerSpeed = 2.5
 let isTransitioning = false
 let cameraTargetPos = new THREE.Vector3(4, 2.5, 6)
 let currentAnim = 'idle'
@@ -34,6 +44,9 @@ let modelAnimations = []
 let playerGroup = null
 let currentSceneId = null
 let roomBounds = { minX: -3.5, maxX: 3.5, minZ: -2.5, maxZ: 2.5 }
+let playerAction = null // 保存当前动画 Action 引用
+let initialBoneMatrices = null // 保存骨骼初始姿态矩阵
+let playerModel = null // 保存 FBX 模型引用
 
 // ===== F 键交互状态 =====
 let interactNpc = null
@@ -44,10 +57,12 @@ const INTERACT_DISTANCE = 2.0
 // ===== 碰撞检测系统 =====
 // 存储场景中的碰撞体（桌椅等家具）
 let collisionBoxes = []
-// 玩家碰撞半径（减小到0.2，给玩家更多移动空间）
-const PLAYER_RADIUS = 0.2
-// GLB模型碰撞体缩放系数，0.6表示只保留模型包围盒60%的大小
-// 这样可以只碰撞桌子主体，椅子等次要部分可以穿模
+let collisionDebugGroup = null
+let showCollisionDebug = false
+
+// 玩家碰撞半径（根据新模型大小调整）
+const PLAYER_RADIUS = 0.25
+// GLB模型碰撞体缩放系数（0.6=覆盖家具实际尺寸，避免穿模）
 const GLB_COLLISION_SCALE = 0.6
 
 // 添加碰撞体（长方体）
@@ -57,6 +72,146 @@ function addCollisionBox(x, z, width, depth) {
     halfWidth: width / 2,
     halfDepth: depth / 2
   })
+  // 如果调试模式开启，立即更新可视化
+  if (showCollisionDebug) updateCollisionDebugVisual()
+}
+
+// 为GLB模型的每个子网格单独生成碰撞体（精确匹配家具实际尺寸）
+function addCollisionBoxesFromModel(model, scale = 1.0) {
+  model.updateWorldMatrix(true, true)
+  const meshBoxes = []
+  model.traverse((child) => {
+    if (child.isMesh && child.geometry) {
+      const box = new THREE.Box3().setFromObject(child)
+      const size = new THREE.Vector3()
+      box.getSize(size)
+      const center = new THREE.Vector3()
+      box.getCenter(center)
+      
+      // 只抓取"大网格"主体部分：桌面、椅面、柜子、隔断墙
+      // 过滤掉桌腿、把手等小部件
+      const isDesk = size.x > 0.8 && size.z > 0.4 && size.y > 0.5
+      const isSeat = size.x > 0.4 && size.z > 0.4 && size.y > 0.4 && size.y < 1.2
+      const isCabinet = size.x > 0.3 && size.z > 0.3 && size.y > 0.6
+      // 隔断/墙板：一个方向很长(>0.6m)，另一个方向很薄(0.08-1.5m)，高度>0.7m
+      // 支持大面板：X可达5m, Z可达1.5m
+      const isPartition = (
+        (size.x > 0.6 && size.z > 0.08 && size.z < 1.5 && size.y > 0.7) ||
+        (size.z > 0.6 && size.x > 0.08 && size.x < 1.5 && size.y > 0.7)
+      )
+      // 大墙板/整面墙：X或Z方向>2m，厚度0.1-1.5m，高度>1m
+      const isWall = (
+        (size.x > 2 && size.z > 0.1 && size.z < 1.5 && size.y > 1) ||
+        (size.z > 2 && size.x > 0.1 && size.x < 1.5 && size.y > 1)
+      )
+      
+      if (isDesk || isSeat || isCabinet || isPartition || isWall) {
+        // 桌子：实际尺寸×0.85
+        // 椅子：1.1倍，贴近椅子边缘（之前1.4太大超出范围）
+        // 柜子/隔断/墙：1.0倍完整覆盖
+        let w, d
+        if (isSeat) {
+          w = size.x * 1.1
+          d = size.z * 1.1
+        } else if (isCabinet || isPartition || isWall) {
+          w = size.x * 1.0
+          d = size.z * 1.0
+        } else {
+          w = size.x * 0.85
+          d = size.z * 0.85
+        }
+        meshBoxes.push({
+          x: center.x,
+          z: center.z,
+          w: w,
+          d: d
+        })
+        console.log('📦 网格: 位置=(' + center.x.toFixed(2) + ',' + center.z.toFixed(2) + 
+          ') 实际尺寸=(' + size.x.toFixed(2) + 'x' + size.z.toFixed(2) + 
+          ') 碰撞体=(' + w.toFixed(2) + 'x' + d.toFixed(2) + ')')
+      }
+    }
+  })
+  
+  // 合并重叠/邻近碰撞体（距离<0.3m才合并，避免左右家具被合并）
+  const merged = []
+  for (const b of meshBoxes) {
+    let mergedInto = false
+    for (let i = 0; i < merged.length; i++) {
+      const m = merged[i]
+      // 计算两个矩形的边缘距离
+      const bLeft = b.x - b.w / 2, bRight = b.x + b.w / 2
+      const bFront = b.z - b.d / 2, bBack = b.z + b.d / 2
+      const mLeft = m.x - m.w / 2, mRight = m.x + m.w / 2
+      const mFront = m.z - m.d / 2, mBack = m.z + m.d / 2
+      const gapX = Math.max(0, Math.max(bLeft, mLeft) - Math.min(bRight, mRight))
+      const gapZ = Math.max(0, Math.max(bFront, mFront) - Math.min(bBack, mBack))
+      if (gapX < 0.3 && gapZ < 0.3) {
+        // AABB并集：取左最小、右最大
+        const unionLeft = Math.min(bLeft, mLeft)
+        const unionRight = Math.max(bRight, mRight)
+        const unionFront = Math.min(bFront, mFront)
+        const unionBack = Math.max(bBack, mBack)
+        const newW = unionRight - unionLeft
+        const newD = unionBack - unionFront
+        const newX = (unionLeft + unionRight) / 2
+        const newZ = (unionFront + unionBack) / 2
+        merged[i] = { x: newX, z: newZ, w: newW, d: newD }
+        mergedInto = true
+        break
+      }
+    }
+    if (!mergedInto) {
+      merged.push({ x: b.x, z: b.z, w: b.w, d: b.d })
+    }
+  }
+  
+  // 添加合并后的碰撞体
+  for (const m of merged) {
+    console.log('📦 最终碰撞体: 位置=(' + m.x.toFixed(2) + ',' + m.z.toFixed(2) + 
+      ') 尺寸=(' + m.w.toFixed(2) + 'x' + m.d.toFixed(2) + ')')
+    addCollisionBox(m.x, m.z, m.w, m.d)
+  }
+  console.log('📦 GLB模型共生成', merged.length, '个独立碰撞体')
+}
+
+// 更新碰撞体调试可视化
+function updateCollisionDebugVisual() {
+  if (!scene) return
+  if (showCollisionDebug) {
+    if (!collisionDebugGroup) {
+      collisionDebugGroup = new THREE.Group()
+    } else {
+      scene.remove(collisionDebugGroup)
+      collisionDebugGroup.clear()
+    }
+    for (const box of collisionBoxes) {
+      const w = box.halfWidth * 2
+      const d = box.halfDepth * 2
+      const geo = new THREE.BoxGeometry(w, 0.05, d)
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xff0000,
+        transparent: true,
+        opacity: 0.35,
+        wireframe: false
+      })
+      const mesh = new THREE.Mesh(geo, mat)
+      mesh.position.set(box.x, 0.03, box.z)
+      collisionDebugGroup.add(mesh)
+
+      const edges = new THREE.EdgesGeometry(geo)
+      const lineMat = new THREE.LineBasicMaterial({ color: 0xff0000 })
+      const wireframe = new THREE.LineSegments(edges, lineMat)
+      wireframe.position.set(box.x, 0.03, box.z)
+      collisionDebugGroup.add(wireframe)
+    }
+    scene.add(collisionDebugGroup)
+  } else {
+    if (collisionDebugGroup) {
+      scene.remove(collisionDebugGroup)
+      collisionDebugGroup = null
+    }
+  }
 }
 
 // 检测点是否与碰撞体碰撞
@@ -109,6 +264,11 @@ function clearSceneObjects() {
   canInteract = false
   // 清空碰撞体数组
   collisionBoxes = []
+  // 清理调试可视化
+  if (collisionDebugGroup) {
+    scene.remove(collisionDebugGroup)
+    collisionDebugGroup = null
+  }
 }
 
 // ============================================================
@@ -373,6 +533,9 @@ function createNPC({
     npc.rotation.y = facing;
     sceneObjects.add(npc);
 
+    // 添加NPC碰撞体，防止玩家穿过
+    addCollisionBox(x, z, 0.5, 0.5);
+
     // 加载GLB
     const gltfLoader = new GLTFLoader();
     gltfLoader.load(glbUrl, (gltf) => {
@@ -418,6 +581,9 @@ function createNPC({
   npc.position.set(x, 0, z)
   npc.rotation.y = facing
   sceneObjects.add(npc)
+
+  // 添加NPC碰撞体，防止玩家穿过
+  addCollisionBox(x, z, 0.5, 0.5);
 
   const body = new THREE.Mesh(
     new THREE.CylinderGeometry(0.22, 0.28, 0.5, 10),
@@ -559,14 +725,8 @@ gltfLoader10.load('/models/Untitled_10.glb', (gltf) => {
   sceneObjects.add(model)
   
   // ===== 自动添加碰撞体 =====
-  // 根据模型实际包围盒添加碰撞体（使用包围盒中心点，支持旋转模型）
-  const box = new THREE.Box3().setFromObject(model)
-  const center = new THREE.Vector3()
-  box.getCenter(center)
-  const size = new THREE.Vector3()
-  box.getSize(size)
-  console.log('📦 GLB模型碰撞体: 中心=', center, '尺寸=', size)
-  addCollisionBox(center.x, center.z, size.x * GLB_COLLISION_SCALE, size.z * GLB_COLLISION_SCALE)
+  // 为每个子网格单独生成碰撞体（支持多家具模型）
+  addCollisionBoxesFromModel(model)
 },(err)=>console.error(err))
 
 
@@ -589,15 +749,8 @@ gltfLoader10_2.load('/models/Untitled_10.glb', (gltf) => {
   sceneObjects.add(model)
   
   // ===== 自动添加碰撞体 =====
-  // 关键：必须先更新世界矩阵，否则包围盒计算会使用过时的矩阵
-  model.updateWorldMatrix(true, true)
-  const box = new THREE.Box3().setFromObject(model)
-  const center = new THREE.Vector3()
-  box.getCenter(center)
-  const size = new THREE.Vector3()
-  box.getSize(size)
-  console.log('📦 GLB模型碰撞体: 中心=', center, '尺寸=', size)
-  addCollisionBox(center.x, center.z, size.x * GLB_COLLISION_SCALE, size.z * GLB_COLLISION_SCALE)
+  // 为每个子网格单独生成碰撞体（支持多家具模型）
+  addCollisionBoxesFromModel(model)
 },(err)=>console.error(err))
 
 
@@ -629,15 +782,8 @@ gltfLoader10_2.load('/models/Untitled_10.glb', (gltf) => {
     sceneObjects.add(model)
     console.log('✅ 自定义GLB模型加载完成！')
     
-    // ===== 自动添加碰撞体 =====
-    model.updateWorldMatrix(true, true)
-    const box = new THREE.Box3().setFromObject(model)
-    const center = new THREE.Vector3()
-    box.getCenter(center)
-    const size = new THREE.Vector3()
-    box.getSize(size)
-    console.log('📦 GLB模型碰撞体: 中心=', center, '尺寸=', size)
-    addCollisionBox(center.x, center.z, size.x * GLB_COLLISION_SCALE, size.z * GLB_COLLISION_SCALE)
+    // ===== 自动添加碰撞体（每个子网格独立） =====
+    addCollisionBoxesFromModel(model)
   }, undefined, (error) => {
     console.error('❌ GLB模型加载失败:', error)
   })
@@ -689,16 +835,25 @@ gltfLoader10_2.load('/models/Untitled_10.glb', (gltf) => {
   })
 
   // ===== 场景1碰撞体 =====
-  // 白板椅子区域（缩小范围，只碰撞椅子底座）
+  // 白板椅子区域（代码创建的对象）
   addCollisionBox(-10.5, 0, 0.4, 0.4)
-  // GLB模型碰撞体由模型加载时自动添加，此处不再手动添加
-  // 绿植碰撞体（代码创建的对象，保留手动碰撞体）
+  // GLB家具碰撞体由模型加载时自动添加
+  // 绿植碰撞体（代码创建的对象）
   addCollisionBox(-11.0, -8.5, 0.5, 0.5)
   addCollisionBox(11.0, 8.5, 0.5, 0.5)
   addCollisionBox(-11.0, 8.5, 0.5, 0.5)
   addCollisionBox(11.0, -8.5, 0.5, 0.5)
   addCollisionBox(0, -8.5, 0.5, 0.5)
   addCollisionBox(0, 8.5, 0.5, 0.5)
+  
+  // ===== 场景1手动补充碰撞体（堵住隔断缝隙） =====
+  // 玩家真实穿模位置（P键测得）
+  addCollisionBox(6.36, -2.71, 0.5, 0.8)
+  addCollisionBox(6.90, -2.73, 0.5, 0.7)
+  addCollisionBox(5.73, -2.66, 0.5, 0.7)
+  addCollisionBox(6.39, 0.96, 0.5, 0.7)
+  addCollisionBox(5.89, 1.11, 0.5, 0.7)
+  addCollisionBox(7.02, 1.13, 0.5, 0.7)
 
   // 玩家出生点：进门位置
   if (player) player.position.set(0, 0.1, 7.0)
@@ -806,15 +961,8 @@ gltfLoader19.load('/models/Untitled_19.glb', (gltf) => {
   sceneObjects.add(model);
   
   // ===== 自动添加碰撞体 =====
-  // 关键：必须先更新世界矩阵，否则包围盒计算会使用过时的矩阵
-  model.updateWorldMatrix(true, true)
-  const box = new THREE.Box3().setFromObject(model)
-  const center = new THREE.Vector3()
-  box.getCenter(center)
-  const size = new THREE.Vector3()
-  box.getSize(size)
-  console.log('📦 GLB模型碰撞体: 中心=', center, '尺寸=', size)
-  addCollisionBox(center.x, center.z, size.x * GLB_COLLISION_SCALE, size.z * GLB_COLLISION_SCALE)
+  // 为每个子网格单独生成碰撞体（支持多家具模型）
+  addCollisionBoxesFromModel(model)
 
 },
 // 加载进度空占位
@@ -861,14 +1009,14 @@ gltfLoader19.load('/models/Untitled_19.glb', (gltf) => {
   addScreenParticle(0xff88aa, 250, { x: 10, y: 2.5, z: 8 })
 
   // ===== 场景2碰撞体 =====
-  // 会议室桌子区域（缩小范围，只碰撞桌子主体）
+  // 会议室桌子区域（代码创建的对象）
   addCollisionBox(0, 0, 2.0, 1.0)
-  // 白板区域（缩小范围）
+  // 白板区域（代码创建的对象）
   addCollisionBox(-3.5, -4.8, 1.5, 0.3)
-  // 绿植碰撞体（代码创建的对象，保留手动碰撞体）
+  // GLB家具碰撞体由模型加载时自动添加
+  // 绿植碰撞体（代码创建的对象）
   addCollisionBox(-6.0, -4.5, 0.5, 0.5)
   addCollisionBox(6.0, 4.5, 0.5, 0.5)
-  // GLB模型碰撞体由模型加载时自动添加，此处不再手动添加
 
   if (player) player.position.set(0, 0.1, 3.5)
   console.log('✅ 会议室场景构建完成！')
@@ -1005,14 +1153,14 @@ addDoorPanel2(3, 2.8, 0.11, 0, 1.5, 6)
   addScreenParticle(0x44ff88, 500, { x: 10, y: 2.5, z: 8 })
 
   // ===== 场景3碰撞体 =====
-  // 白板区域（缩小范围）
+  // 白板区域（代码创建的对象）
   addCollisionBox(-7.8, 0, 0.8, 0.3)
-  // 绿植碰撞体（代码创建的对象，保留手动碰撞体）
+  // GLB家具碰撞体由模型加载时自动添加
+  // 绿植碰撞体（代码创建的对象）
   addCollisionBox(-7.0, 5.0, 0.5, 0.5)
   addCollisionBox(7.0, -5.0, 0.5, 0.5)
   addCollisionBox(-7.0, -5.0, 0.5, 0.5)
   addCollisionBox(7.0, 5.0, 0.5, 0.5)
-  // 工作台碰撞体由GLB模型加载时自动添加，此处不再手动添加
 
   // 玩家出生点位不变
   if (player) player.position.set(0, 0.1, 4.0)
@@ -1128,8 +1276,8 @@ function buildIntegrationZone() {
   sceneObjects.add(ambientLight)
 
   // ===== 场景4碰撞体 =====
-  // 工位桌椅碰撞体由GLB模型加载时自动添加，此处不再手动添加
-  // 绿植碰撞体（代码创建的对象，保留手动碰撞体）
+  // GLB家具碰撞体由模型加载时自动添加
+  // 绿植碰撞体（代码创建的对象）
   addCollisionBox(-6.0, -4.5, 0.5, 0.5)
   addCollisionBox(6.0, 4.5, 0.5, 0.5)
 
@@ -1378,8 +1526,8 @@ function buildMonitoringRoom() {
   addPlant(7.0, 5.0)
 
   // ===== 场景5碰撞体 =====
-  // 监控大屏、屏幕区域、主工作台碰撞体由GLB模型加载时自动添加，此处不再手动添加
-  // 绿植碰撞体（代码创建的对象，保留手动碰撞体）
+  // GLB家具碰撞体由模型加载时自动添加
+  // 绿植碰撞体（代码创建的对象）
   addCollisionBox(-7.0, -5.0, 0.5, 0.5)
   addCollisionBox(7.0, 5.0, 0.5, 0.5)
 
@@ -1435,9 +1583,9 @@ function createPlayer() {
   group.add(label)
 
   const loader = new FBXLoader()
-  loader.load('/models/Hip Hop Dancing.fbx', (fbx) => {
+  loader.load(PLAYER_MODEL_CONFIG.modelUrl, (fbx) => {
     const model = fbx
-    model.scale.set(0.007, 0.007, 0.007)
+    model.scale.set(PLAYER_MODEL_CONFIG.scale, PLAYER_MODEL_CONFIG.scale, PLAYER_MODEL_CONFIG.scale)
     model.position.set(0, 0, 0)
     model.traverse((child) => {
       if (child.isMesh) {
@@ -1446,6 +1594,17 @@ function createPlayer() {
       }
     })
 
+    // 计算包围盒，让脚底自动贴地（解决脚悬空问题）
+    const box = new THREE.Box3().setFromObject(model)
+    // 将 playerGroup 本身的 Y 设为 0，同时把模型内部 Y 设为 -minY
+    // 这样脚底就在世界坐标 y=0（地面）
+    playerGroup.position.y = 0
+    model.position.y = -box.min.y + (PLAYER_MODEL_CONFIG.groundOffset || 0)
+    console.log('📦 模型贴地调整: groupY=', playerGroup.position.y.toFixed(3), '模型最低点Y=', box.min.y.toFixed(3), '模型位置Y=', model.position.y.toFixed(3))
+
+    // 保存模型引用
+    playerModel = model
+
     const toRemove = []
     group.children.forEach(child => {
       if (!child.isCSS2DObject) toRemove.push(child)
@@ -1453,25 +1612,97 @@ function createPlayer() {
     toRemove.forEach(child => group.remove(child))
     group.add(model)
 
-    if (fbx.animations && fbx.animations.length > 0) {
-      modelAnimations = fbx.animations
-      playerMixer = new THREE.AnimationMixer(model)
-      const idleClip = modelAnimations.find(c =>
-        c.name.toLowerCase().includes('idle') ||
-        c.name.toLowerCase().includes('stand') ||
-        c.name.toLowerCase().includes('loop') ||
-        c.name.toLowerCase().includes('take')
-      ) || modelAnimations[0]
-      if (idleClip) {
-        const action = playerMixer.clipAction(idleClip)
-        action.play()
-        currentAnim = 'idle'
-        console.log('✅ 播放 idle 动画:', idleClip.name)
+    // 创建 AnimationMixer（基于主模型的骨骼结构）
+    playerMixer = new THREE.AnimationMixer(model)
+    modelAnimations = []
+    window._playerAnimations = { idle: null, walk: null, default: null }
+
+    // 保存骨骼初始姿态（用于 fallback 直立姿态）
+    initialBoneMatrices = {}
+    model.traverse((child) => {
+      if (child.isBone) {
+        initialBoneMatrices[child.uuid] = {
+          position: child.position.clone(),
+          quaternion: child.quaternion.clone(),
+          scale: child.scale.clone()
+        }
       }
-    } else {
-      console.warn('⚠️ FBX 文件没有动画')
+    })
+    console.log('✅ 已保存骨骼初始姿态，骨骼数量:', Object.keys(initialBoneMatrices).length)
+
+    // 并行加载 Idle 和 Walking 动画文件
+    let idleLoaded = false
+    let walkLoaded = false
+    const tryPlayIdle = () => {
+      // 当 idle 动画加载完成后，默认播放 idle
+      if (window._playerAnimations.idle && !idleLoaded) {
+        idleLoaded = true
+        playerAction = playerMixer.clipAction(window._playerAnimations.idle)
+        playerAction.setLoop(THREE.LoopRepeat, Infinity)
+        playerAction.play()
+        currentAnim = 'idle'
+        console.log('✅ 默认播放 Idle 动画')
+      }
     }
-    console.log('✅ FBX 模型加载成功！')
+
+    const idleLoader = new FBXLoader()
+    idleLoader.load(PLAYER_MODEL_CONFIG.idleUrl, (idleFbx) => {
+      if (idleFbx.animations && idleFbx.animations.length > 0) {
+        const idleClip = idleFbx.animations[0]
+        modelAnimations.push(idleClip)
+        window._playerAnimations.idle = idleClip
+        console.log('✅ Idle 动画加载成功:', idleClip.name)
+        tryPlayIdle()
+      }
+    }, undefined, (err) => console.warn('⚠️ Idle 动画加载失败:', err.message))
+
+    const walkLoader = new FBXLoader()
+    walkLoader.load(PLAYER_MODEL_CONFIG.walkUrl, (walkFbx) => {
+      if (walkFbx.animations && walkFbx.animations.length > 0) {
+        let walkClip = walkFbx.animations[0]
+
+        // 1. 移除位置轨道（根运动数据）：Mixamo 未勾选 "In Place" 时包含位置轨道，
+        //    循环时位置重置导致可见跳跃。只保留旋转轨道即可正确播放行走动作
+        const originalTrackCount = walkClip.tracks.length
+        const positionTracks = walkClip.tracks.filter(t => t.name.includes('.position'))
+        walkClip.tracks = walkClip.tracks.filter(t => !t.name.includes('.position'))
+        console.log('✅ Walk动画移除位置轨道:', positionTracks.length, '条, 剩余轨道:', walkClip.tracks.length, '/', originalTrackCount)
+
+        // 2. 重新计算 duration（移除轨道后需要更新）
+        walkClip.resetDuration()
+
+        // 3. 用 subclip 裁剪末尾2帧（进一步消除循环点差异）
+        if (walkClip.tracks && walkClip.tracks.length > 0 && THREE.AnimationUtils) {
+          const track = walkClip.tracks[0]
+          if (track.times && track.times.length > 4) {
+            const numKeys = track.times.length
+            const fps = (numKeys - 1) / walkClip.duration
+            const totalFrames = Math.round(walkClip.duration * fps)
+            const trimFrames = 2
+            const endFrame = Math.max(totalFrames - trimFrames - 1, 1)
+            try {
+              walkClip = THREE.AnimationUtils.subclip(walkClip, 'walk_trimmed', 0, endFrame, fps)
+              console.log('✅ Walk动画裁剪末尾帧, endFrame:', endFrame, '新时长:', walkClip.duration.toFixed(3))
+            } catch (e) {
+              console.warn('⚠️ subclip失败，使用原始clip:', e.message)
+            }
+          }
+        }
+
+        modelAnimations.push(walkClip)
+        window._playerAnimations.walk = walkClip
+        console.log('✅ Walking 动画加载成功:', walkClip.name, '时长:', walkClip.duration.toFixed(3), '轨道数:', walkClip.tracks.length)
+        // 如果 walk 先加载完，也尝试播放 idle（若 idle 尚未加载则先用 walk 当默认）
+        if (!playerAction) {
+          playerAction = playerMixer.clipAction(walkClip)
+          playerAction.setLoop(THREE.LoopRepeat, Infinity)
+          playerAction.play()
+          currentAnim = 'idle'
+        }
+      }
+    }, undefined, (err) => console.warn('⚠️ Walking 动画加载失败:', err.message))
+
+    console.log('✅ 西装男模型加载成功！')
   }, undefined, (error) => {
     console.warn('⚠️ FBX 模型加载失败，使用几何体:', error.message)
   })
@@ -1479,16 +1710,66 @@ function createPlayer() {
   return group
 }
 
+// ===== 骨骼姿态重置 =====
+function resetBonesToInitialPose(model) {
+  if (!model || !initialBoneMatrices) return
+  model.traverse((child) => {
+    if (child.isBone && initialBoneMatrices[child.uuid]) {
+      const saved = initialBoneMatrices[child.uuid]
+      child.position.copy(saved.position)
+      child.quaternion.copy(saved.quaternion)
+      child.scale.copy(saved.scale)
+      child.updateMatrix()
+      child.updateMatrixWorld(true)
+    }
+  })
+}
+
 function switchAnimation(animName) {
-  if (!playerMixer || !modelAnimations.length || currentAnim === animName) return
-  const clip = modelAnimations.find(c => c.name.toLowerCase().includes(animName))
-  if (!clip) return
+  if (!playerMixer) return
+
+  const animRefs = window._playerAnimations || {}
+  const hasIdleAnim = !!animRefs.idle
+  const hasWalkAnim = !!animRefs.walk
+
+  if (animName === 'walk') {
+    if (hasWalkAnim) {
+      const walkAction = playerMixer.clipAction(animRefs.walk)
+      walkAction.setLoop(THREE.LoopRepeat, Infinity)
+      if (playerAction !== walkAction) {
+        if (playerAction) playerAction.fadeOut(0.3)
+        playerAction = walkAction
+        playerAction.reset()
+        playerAction.setEffectiveWeight(1)
+        playerAction.setEffectiveTimeScale(PLAYER_MODEL_CONFIG.walkTimeScale || 1)
+        playerAction.play()
+      } else if (playerAction.paused) {
+        playerAction.paused = false
+      }
+    } else if (playerAction) {
+      playerAction.paused = false
+    }
+  } else if (animName === 'idle') {
+    if (hasIdleAnim) {
+      const idleAction = playerMixer.clipAction(animRefs.idle)
+      idleAction.setLoop(THREE.LoopRepeat, Infinity)
+      if (playerAction !== idleAction) {
+        if (playerAction) playerAction.fadeOut(0.3)
+        playerAction = idleAction
+        playerAction.reset()
+        playerAction.setEffectiveWeight(1)
+        playerAction.setEffectiveTimeScale(1)
+        playerAction.play()
+      } else if (playerAction.paused) {
+        playerAction.paused = false
+      }
+    } else if (playerAction) {
+      playerAction.stop()
+      resetBonesToInitialPose(playerModel)
+    }
+  }
+
   currentAnim = animName
-  playerMixer.stopAllAction()
-  const action = playerMixer.clipAction(clip)
-  action.reset()
-  action.fadeIn(0.2)
-  action.play()
 }
 
 // ===== 初始化 =====
@@ -1567,6 +1848,21 @@ function bindEvents() {
         }
         e.preventDefault()
         break
+      case 'KeyC':
+        // 切换碰撞体调试可视化
+        showCollisionDebug = !showCollisionDebug
+        updateCollisionDebugVisual()
+        console.log('📦 碰撞体调试模式:', showCollisionDebug ? '开启' : '关闭')
+        e.preventDefault()
+        break
+      case 'KeyP':
+        // 打印玩家当前坐标（用于手动加碰撞体）
+        if (playerGroup) {
+          console.log('📍 玩家位置: x=' + playerGroup.position.x.toFixed(2) + 
+            ', z=' + playerGroup.position.z.toFixed(2))
+        }
+        e.preventDefault()
+        break
     }
   })
   document.addEventListener('keyup', (e) => {
@@ -1588,8 +1884,8 @@ function bindEvents() {
     if (!isDragging) return
     const dx = e.clientX - prevMouse.x
     const dy = e.clientY - prevMouse.y
-    targetOrbitAngle -= dx * 0.005
-    targetOrbitPitch = Math.max(0.1, Math.min(1.2, targetOrbitPitch + dy * 0.005))
+    targetOrbitAngle -= dx * 0.003
+    targetOrbitPitch = Math.max(-0.3, Math.min(0.7, targetOrbitPitch + dy * 0.003))
     prevMouse.x = e.clientX
     prevMouse.y = e.clientY
   })
@@ -1670,11 +1966,6 @@ function animate() {
   orbitPitch += (targetOrbitPitch - orbitPitch) * lerpFactor
 
   if (player) {
-    const targetQuat = new THREE.Quaternion().setFromEuler(
-      new THREE.Euler(0, orbitAngle + Math.PI, 0, 'YXZ')
-    )
-    player.quaternion.slerp(targetQuat, 0.1)
-
     const camForward = new THREE.Vector3(0, 0, -1)
     const camQuat = new THREE.Quaternion().setFromEuler(
       new THREE.Euler(0, orbitAngle, 0, 'YXZ')
@@ -1695,6 +1986,66 @@ function animate() {
     if (keys.d) move.add(camRight)
 
     const isMoving = move.length() > 0
+
+    // 角色朝向：移动时转向移动方向，静止时保持相机前方（面向用户）
+    let targetQuat
+    if (isMoving) {
+      const moveDir = move.clone().normalize()
+      // 从移动方向计算Y轴旋转角度
+      const moveAngle = Math.atan2(moveDir.x, moveDir.z)
+      targetQuat = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(0, moveAngle, 0, 'YXZ')
+      )
+    } else {
+      // 静止时面向相机前方（角色背对相机，面朝用户视野方向）
+      targetQuat = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(0, orbitAngle + Math.PI, 0, 'YXZ')
+      )
+    }
+    player.quaternion.slerp(targetQuat, 0.15)
+
+    // 判断前进/后退方向（用于动画倒放）
+    let isBackward = false
+    if (isMoving) {
+      const moveDir = move.clone().normalize()
+      isBackward = moveDir.dot(camForward) < -0.1
+    }
+
+    // 只在状态(idle/walk)改变时切换动画，避免每帧都调用
+    const desiredAnim = isMoving ? 'walk' : 'idle'
+    if (desiredAnim !== currentAnim) {
+      if (modelAnimations.length > 0) {
+        switchAnimation(desiredAnim)
+      }
+    }
+
+    // walk/idle 状态处理：方向更新
+    if (playerAction) {
+      const baseScale = PLAYER_MODEL_CONFIG.walkTimeScale || 1
+      if (currentAnim === 'walk') {
+        const targetScale = isBackward ? -baseScale : baseScale
+        const currentScale = playerAction.getEffectiveTimeScale()
+
+        // 只在方向翻转时操作：设置time起点 + 更新timeScale
+        if (Math.abs(targetScale - currentScale) > 0.001) {
+          const clip = window._playerAnimations?.walk
+          if (clip && clip.duration) {
+            if (targetScale < 0) {
+              playerAction.time = Math.max(clip.duration - 0.001, 0)
+            } else {
+              playerAction.time = 0.001
+            }
+          }
+          playerAction.setEffectiveTimeScale(targetScale)
+        }
+      }
+    }
+
+    // 安全兜底：静止时每帧都重置骨骼到直立姿态（防止动画残留）
+    if (!isMoving && playerModel && !window._playerAnimations?.idle) {
+      resetBonesToInitialPose(playerModel)
+    }
+    
     if (isMoving) {
       move.normalize().multiplyScalar(playerSpeed * 0.016)
       
@@ -1710,10 +2061,6 @@ function animate() {
       // 边界限制：不出场景范围
       player.position.x = Math.max(roomBounds.minX, Math.min(roomBounds.maxX, player.position.x))
       player.position.z = Math.max(roomBounds.minZ, Math.min(roomBounds.maxZ, player.position.z))
-      
-      if (modelAnimations.length > 0) switchAnimation('walk')
-    } else {
-      if (modelAnimations.length > 0) switchAnimation('idle')
     }
 
     if (playerMixer) playerMixer.update(0.016)
@@ -1723,15 +2070,17 @@ function animate() {
   }
 
   if (player) {
-    const offset = new THREE.Vector3(0, 2.2, 3.0)
+    const offset = new THREE.Vector3(0, 2.0, 2.2)
     const rot = new THREE.Quaternion().setFromEuler(
       new THREE.Euler(orbitPitch, orbitAngle, 0, 'YXZ')
     )
     offset.applyQuaternion(rot)
     let targetPos = player.position.clone().add(offset)
 
-    targetPos.x = Math.max(roomBounds.minX + 0.5, Math.min(roomBounds.maxX - 0.5, targetPos.x))
-    targetPos.z = Math.max(roomBounds.minZ + 0.5, Math.min(roomBounds.maxZ - 0.5, targetPos.z))
+    // 放宽相机边界，允许相机在角色周围自由环绕观察
+    // 只限制在房间范围内，不强制贴着角色
+    targetPos.x = Math.max(roomBounds.minX - 1, Math.min(roomBounds.maxX + 1, targetPos.x))
+    targetPos.z = Math.max(roomBounds.minZ - 1, Math.min(roomBounds.maxZ + 1, targetPos.z))
 
     camera.position.lerp(targetPos, 0.08)
     if (camera.position.distanceTo(targetPos) > 2) {
